@@ -18,7 +18,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 import io
 
-from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import Conflict
 from telegram.ext import (
@@ -34,18 +40,22 @@ from bin_leads_store import (
     SECONDHAND_PRICE_USD,
     bin_line_counts,
     clear_bin_leads,
+    format_notebook_text,
     get_lines_for_bin,
+    groups_from_raw_paste,
+    merge_groups_from_web,
     norm_stock_tier,
     pop_n_random_any,
     pop_n_random_from_bin,
     restore_pairs_triples,
     state_breakdown_for_bin,
     states_compact_for_bin,
+    stock_tiers_api_payload,
     total_line_count,
 )
 
 PRICE_SECONDHAND = SECONDHAND_PRICE_USD
-from catalog_store import add_bin, clear_all_bins, load_catalog
+from catalog_store import add_bin, clear_all_bins, format_sendout_text, load_catalog
 from pending_topups import (
     create_pending,
     get_pending,
@@ -56,7 +66,7 @@ from data_paths import data_dir
 
 _ROOT = Path(__file__).resolve().parent
 _BOT_FILE = Path(__file__).resolve()
-BOT_BUILD = "shop-v7"
+BOT_BUILD = "shop-v9"
 # Only one bot process per PC for this project (avoids Telegram getUpdates Conflict).
 _INSTANCE_PORT = 37651
 _keepalive_sock: socket.socket | None = None
@@ -486,20 +496,95 @@ def format_admin_topup_message(pid: str, rec: dict) -> str:
     )
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(for_user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("📊 Purchase Leads", callback_data="pur")],
+        [
+            InlineKeyboardButton("💰 My Balance", callback_data="bal"),
+            InlineKeyboardButton("💳 Top Up", callback_data="top"),
+        ],
+        [
+            InlineKeyboardButton("🛒 My Cart", callback_data="cart"),
+            InlineKeyboardButton("👤 My Profile", callback_data="prof"),
+        ],
+    ]
+    if for_user_id is not None and for_user_id in get_admin_ids():
+        rows.append([InlineKeyboardButton("🔧 Admin panel", callback_data="adm")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_panel_text() -> str:
+    return (
+        "🔧 <b>Admin panel</b>\n\n"
+        "Same jobs as the BIN web tool — no GitHub Pages or local URL setup.\n"
+        "• <b>Stock</b> — firsthand + secondhand line counts per BIN\n"
+        "• <b>Sync</b> — paste pipe-separated lines or send a <b>.txt</b> file → chosen pile\n"
+        "• <b>Sendout</b> — posts the summary to <code>UPLOAD_NOTIFY_CHAT_ID</code>\n"
+        "• <b>BIN notebook</b> — download all lines for one BIN from a pile\n\n"
+        "Commands: <code>/addbin</code> · <code>/clearbin</code> · <code>/cancel</code>"
+    )
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📊 Purchase Leads", callback_data="pur")],
+            [InlineKeyboardButton("📊 Stock summary", callback_data="adm_st")],
             [
-                InlineKeyboardButton("💰 My Balance", callback_data="bal"),
-                InlineKeyboardButton("💳 Top Up", callback_data="top"),
+                InlineKeyboardButton("📥 Sync (paste / file)", callback_data="adm_sy"),
+                InlineKeyboardButton("📤 Sendout", callback_data="adm_so"),
             ],
-            [
-                InlineKeyboardButton("🛒 My Cart", callback_data="cart"),
-                InlineKeyboardButton("👤 My Profile", callback_data="prof"),
-            ],
+            [InlineKeyboardButton("📓 BIN notebook", callback_data="adm_nb")],
+            [InlineKeyboardButton("⬅️ Home", callback_data="home")],
         ]
     )
+
+
+def _admin_stock_summary_plain() -> str:
+    st = stock_tiers_api_payload()
+    lines = [
+        "📊 STOCK (two piles)",
+        f"Firsthand: {st['first']['total_lines']} lines × ${st['first']['price']:.2f}",
+        f"Secondhand: {st['second']['total_lines']} lines × ${st['second']['price']:.2f}",
+        "",
+        "━━ Firsthand BINs ━━",
+    ]
+    for row in st["first"]["bins"][:45]:
+        lines.append(f"  {row['bin']} ×{row['count']}")
+    if len(st["first"]["bins"]) > 45:
+        lines.append(f"  … +{len(st['first']['bins']) - 45} more")
+    lines += ["", "━━ Secondhand BINs ━━"]
+    for row in st["second"]["bins"][:45]:
+        lines.append(f"  {row['bin']} ×{row['count']}")
+    if len(st["second"]["bins"]) > 45:
+        lines.append(f"  … +{len(st['second']['bins']) - 45} more")
+    return "\n".join(lines)
+
+
+def _admin_clear_sync_await(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_admin_paste", None)
+    context.user_data.pop("admin_sync_tier", None)
+
+
+def _admin_clear_nb_await(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_admin_nb_bin", None)
+    context.user_data.pop("admin_nb_tier", None)
+
+
+async def _deliver_sendout_telegram(bot, chat_id: int) -> tuple[bool, str]:
+    text = format_sendout_text()
+    try:
+        if len(text) <= 3800:
+            await bot.send_message(chat_id=chat_id, text=text)
+        else:
+            bio = io.BytesIO(text.encode("utf-8"))
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(bio, filename="bin_sendout.txt"),
+                caption="📤 Sendout — firsthand + secondhand",
+            )
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:220]
 
 
 def purchase_menu_keyboard() -> InlineKeyboardMarkup:
@@ -762,10 +847,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
     ensure_user(update.effective_user.id)
+    uid = update.effective_user.id
     await update.message.reply_text(
-        welcome_text(update.effective_user.id),
+        welcome_text(uid),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(uid),
     )
 
 
@@ -779,6 +865,8 @@ async def purchase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.user_data.pop("await_bin_qty_bin", None)
     context.user_data.pop("await_bin_qty_tier", None)
     context.user_data.pop("awaiting_random_qty", None)
+    _admin_clear_sync_await(context)
+    _admin_clear_nb_await(context)
     await update.message.reply_text(
         purchase_intro_text(),
         parse_mode=ParseMode.HTML,
@@ -821,7 +909,7 @@ async def show_home(
     query, context: ContextTypes.DEFAULT_TYPE, user_id: int, edit: bool
 ) -> None:
     text = welcome_text(user_id)
-    markup = main_menu_keyboard()
+    markup = main_menu_keyboard(user_id)
     if edit:
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=markup
@@ -898,6 +986,15 @@ async def show_payment_methods(
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
+
+    uid = update.effective_user.id
+    if uid in get_admin_ids():
+        if context.user_data.get("awaiting_admin_nb_bin"):
+            await _admin_consume_notebook_bin(update, context)
+            return
+        if context.user_data.get("awaiting_admin_paste"):
+            await _admin_consume_paste_text(update, context)
+            return
 
     if context.user_data.get("awaiting_topup_custom"):
         raw = (update.message.text or "").strip().replace("$", "").replace(",", "")
@@ -1135,6 +1232,127 @@ async def addbin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if uid not in get_admin_ids():
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        admin_panel_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    _admin_clear_sync_await(context)
+    _admin_clear_nb_await(context)
+    await update.message.reply_text(
+        "Cancelled — admin sync / notebook prompts cleared.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _admin_consume_paste_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    tier = context.user_data.get("admin_sync_tier", "first")
+    groups = groups_from_raw_paste(msg.text)
+    if not groups:
+        await msg.reply_text(
+            "No valid lines (need <code>card|field|…</code> with 6+ digit card prefix).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    stats = merge_groups_from_web(groups, tier=tier)
+    _admin_clear_sync_await(context)
+    pile = "secondhand" if tier == "second" else "firsthand"
+    await msg.reply_text(
+        f"✅ Synced → <b>{pile}</b>\n"
+        f"BINs touched: <b>{stats.get('bins_touched', 0)}</b>\n"
+        f"New lines: <b>+{stats.get('lines_added', 0)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _admin_consume_paste_doc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    doc = msg.document if msg else None
+    if not doc:
+        return
+    if doc.file_size and doc.file_size > 12_000_000:
+        await msg.reply_text("File too large (try under ~12 MB).")
+        return
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        raw = buf.getvalue().decode("utf-8", errors="replace")
+    except Exception as e:
+        await msg.reply_text(f"Could not read file: {e!s}"[:200])
+        return
+    tier = context.user_data.get("admin_sync_tier", "first")
+    groups = groups_from_raw_paste(raw)
+    if not groups:
+        await msg.reply_text("No valid card lines in that file.")
+        return
+    stats = merge_groups_from_web(groups, tier=tier)
+    _admin_clear_sync_await(context)
+    pile = "secondhand" if tier == "second" else "firsthand"
+    await msg.reply_text(
+        f"✅ From file → <b>{pile}</b>\n"
+        f"BINs touched: <b>{stats.get('bins_touched', 0)}</b>\n"
+        f"New lines: <b>+{stats.get('lines_added', 0)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _admin_consume_notebook_bin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    raw = "".join(c for c in msg.text.strip() if c.isdigit())[:6]
+    if len(raw) != 6:
+        await msg.reply_text(
+            "Send exactly <b>6 digits</b> (one BIN).", parse_mode=ParseMode.HTML
+        )
+        return
+    tier = context.user_data.get("admin_nb_tier", "first")
+    lines = get_lines_for_bin(raw, tier)
+    if not lines:
+        await msg.reply_text(
+            f"No lines for <code>{escape(raw)}</code> in the <b>{tier}</b> pile.",
+            parse_mode=ParseMode.HTML,
+        )
+        _admin_clear_nb_await(context)
+        return
+    body = format_notebook_text(raw, lines)
+    bio = io.BytesIO(body.encode("utf-8"))
+    tlab = "1st" if tier == "first" else "2nd"
+    await msg.reply_document(
+        document=InputFile(bio, filename=f"bin_{raw}_{tlab}.txt"),
+        caption=f"BIN <code>{raw}</code> · {tlab} pile · {len(lines)} lines",
+        parse_mode=ParseMode.HTML,
+    )
+    _admin_clear_nb_await(context)
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.message.document:
+        return
+    uid = update.effective_user.id
+    if uid not in get_admin_ids():
+        return
+    if not context.user_data.get("awaiting_admin_paste"):
+        return
+    await _admin_consume_paste_doc(update, context)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not update.effective_user:
@@ -1150,7 +1368,150 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("await_bin_qty_bin", None)
         context.user_data.pop("await_bin_qty_tier", None)
         context.user_data.pop("awaiting_random_qty", None)
+        _admin_clear_sync_await(context)
+        _admin_clear_nb_await(context)
         await show_home(query, context, user_id, edit=True)
+        return
+
+    if data == "adm":
+        if user_id not in get_admin_ids():
+            return
+        await query.edit_message_text(
+            admin_panel_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return
+
+    if data == "adm_st":
+        if user_id not in get_admin_ids():
+            return
+        summary = _admin_stock_summary_plain()
+        await query.message.reply_text(summary)
+        return
+
+    if data == "adm_so":
+        if user_id not in get_admin_ids():
+            return
+        raw_chat = os.environ.get("UPLOAD_NOTIFY_CHAT_ID", "").strip()
+        if not raw_chat.isdigit():
+            await query.message.reply_text(
+                "Set <code>UPLOAD_NOTIFY_CHAT_ID</code> in .env for sendout target.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        ok, err = await _deliver_sendout_telegram(context.bot, int(raw_chat))
+        if ok:
+            await query.message.reply_text(
+                f"✅ Sendout posted to chat <code>{raw_chat}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.message.reply_text(f"⛔ Sendout failed: {escape(err)}", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "adm_sy":
+        if user_id not in get_admin_ids():
+            return
+        bp = _catalog_bin_price()
+        await query.edit_message_text(
+            "📥 <b>Sync leads</b>\n\n"
+            f"Choose which pile (same as the web tool). Firsthand uses catalog price "
+            f"<b>${bp:.2f}</b> · Secondhand <b>${PRICE_SECONDHAND:.2f}</b>.\n\n"
+            "Next step: paste lines or send a <b>.txt</b> file.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"Firsthand (${bp:.2f})",
+                            callback_data="adm_syf",
+                        ),
+                        InlineKeyboardButton(
+                            f"Secondhand (${PRICE_SECONDHAND:.2f})",
+                            callback_data="adm_sys",
+                        ),
+                    ],
+                    [InlineKeyboardButton("⬅️ Admin", callback_data="adm")],
+                ]
+            ),
+        )
+        return
+
+    if data in ("adm_syf", "adm_sys"):
+        if user_id not in get_admin_ids():
+            return
+        tier = "first" if data == "adm_syf" else "second"
+        context.user_data["admin_sync_tier"] = tier
+        context.user_data["awaiting_admin_paste"] = True
+        lbl = "Firsthand" if tier == "first" else "Secondhand"
+        await query.edit_message_text(
+            f"📥 <b>Sync → {lbl}</b>\n\n"
+            "Send <b>one message</b> with pipe-separated lines, "
+            "or send a <b>.txt</b> / document.\n"
+            "<code>/cancel</code> aborts.\n\n"
+            "<i>Same grouping as the web START (first 6 digits before |).</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Cancel sync", callback_data="adm_can")]]
+            ),
+        )
+        return
+
+    if data == "adm_can":
+        if user_id not in get_admin_ids():
+            return
+        _admin_clear_sync_await(context)
+        await query.edit_message_text(
+            admin_panel_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
+        return
+
+    if data == "adm_nb":
+        if user_id not in get_admin_ids():
+            return
+        await query.edit_message_text(
+            "📓 <b>BIN notebook</b>\n\nExport all raw lines for one BIN from a pile.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Firsthand pile", callback_data="adm_nbf"),
+                        InlineKeyboardButton("Secondhand pile", callback_data="adm_nbs"),
+                    ],
+                    [InlineKeyboardButton("⬅️ Admin", callback_data="adm")],
+                ]
+            ),
+        )
+        return
+
+    if data in ("adm_nbf", "adm_nbs"):
+        if user_id not in get_admin_ids():
+            return
+        context.user_data["admin_nb_tier"] = "first" if data == "adm_nbf" else "second"
+        context.user_data["awaiting_admin_nb_bin"] = True
+        tlab = "Firsthand" if data == "adm_nbf" else "Secondhand"
+        await query.edit_message_text(
+            f"📓 <b>Notebook · {tlab}</b>\n\n"
+            "Send the <b>6-digit BIN</b> in one message.\n<code>/cancel</code> aborts.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Cancel", callback_data="adm_nbx")]]
+            ),
+        )
+        return
+
+    if data == "adm_nbx":
+        if user_id not in get_admin_ids():
+            return
+        _admin_clear_nb_await(context)
+        await query.edit_message_text(
+            admin_panel_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu_keyboard(),
+        )
         return
 
     if data == "pur":
@@ -1159,6 +1520,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("await_bin_qty_bin", None)
         context.user_data.pop("await_bin_qty_tier", None)
         context.user_data.pop("awaiting_random_qty", None)
+        _admin_clear_sync_await(context)
+        _admin_clear_nb_await(context)
         await query.edit_message_text(
             purchase_intro_text(),
             parse_mode=ParseMode.HTML,
@@ -1700,11 +2063,33 @@ async def _log_started(app: Application) -> None:
     )
 
 
+async def _register_bot_menu(app: Application) -> None:
+    """Populates the blue ▶ Menu button in Telegram (setMyCommands)."""
+    commands = [
+        BotCommand("start", "Home & main buttons"),
+        BotCommand("purchase", "Purchase leads menu"),
+        BotCommand("version", "Build info & tips"),
+        BotCommand("request", "Custom lead request"),
+        BotCommand("cancel", "Cancel admin / prompts"),
+        BotCommand("panel", "Admin: stock, sync, sendout"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+        logger.info("Telegram command menu registered (blue Menu button).")
+    except Exception as e:
+        logger.warning("set_my_commands failed: %s", e)
+
+
+async def _post_init(app: Application) -> None:
+    await _log_started(app)
+    await _register_bot_menu(app)
+
+
 def _run_telegram_polling(token: str) -> None:
     app = (
         Application.builder()
         .token(token)
-        .post_init(_log_started)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", start_cmd))
@@ -1713,7 +2098,11 @@ def _run_telegram_polling(token: str) -> None:
     app.add_handler(CommandHandler("clearbin", clearbin_cmd))
     app.add_handler(CommandHandler("addbin", addbin_cmd))
     app.add_handler(CommandHandler("request", request_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("panel", admin_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)
     )
