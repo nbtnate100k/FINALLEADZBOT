@@ -25,18 +25,26 @@ Or from PowerShell:
 .\run.ps1
 ```
 
-You should see `Logged in as @…` and `build=shop-v7` in the window.
+You should see `Logged in as @…` and `build=shop-v11` in the window.
 
 ### BIN web tool + sendout
 
-With the bot running, open **http://127.0.0.1:8787/** (same PC). Before **START**, choose **Firsthand** ($0.90, from `catalog.json` `price_per_bin`) or **Secondhand** ($0.35). Sync goes to `/api/sync-groups` with `{ "groups", "tier": "first"|"second" }` → **`data/bin_leads.json`** (two piles) + **`data/catalog.json`**. The page shows **two sendout sections** (live via `/api/stock-tiers`). Telegram **Sendout** lists both piles.
+**Telegram does not host the web UI** — it only carries bot messages. The BIN tool is either (a) a page served by the same Python process on **`http://127.0.0.1:8787/`** when you run locally, or (b) static HTML on **GitHub Pages** that must call a **separate HTTPS server** (e.g. Railway) where this repo is deployed; that server runs **Flask (`/api/*`) and the bot together**.
+
+With the bot running locally, open **http://127.0.0.1:8787/** (same PC). Before **START**, choose **Firsthand** ($0.90, from `catalog.json` `price_per_bin`) or **Secondhand** ($0.35). Sync goes to `/api/sync-groups` with `{ "groups", "tier": "first"|"second" }` → **`data/bin_leads.json`** (two piles) + **`data/catalog.json`**. The page shows **two sendout sections** (live via `/api/stock-tiers`). Telegram **Sendout** lists both piles.
 
 - **Telegram purchases:** **Firsthand BINs** vs **Secondhand BINs** (separate browse). Prices **$0.90** / **$0.35**; random bulk draws only from the matching **pile**. **Cart** can mix tiers; checkout removes lines from the correct pile.  
 - **`/addbin`** / **`/clearbin`** (admin): **`/clearbin`** also wipes **`bin_leads.json`** (synced raw lines).
 
 Admins are IDs in `UPLOAD_NOTIFY_CHAT_ID` or `ADMIN_TELEGRAM_IDS` (comma-separated) in `.env`.
 
+**Admin panel (Telegram):** admins see **🔧 Admin panel** on the home menu, or send **`/admin`** / **`/panel`**. From there you can **view stock** (both piles), **sync** pasted lines or a `.txt` file into firsthand/secondhand (same rules as the web START), **sendout** to `UPLOAD_NOTIFY_CHAT_ID`, and **export a BIN notebook** as a `.txt` file — no browser required.
+
 `file://` pages cannot call the API reliably — use the `8787` URL.
+
+### Blue **Menu** button (command list)
+
+Telegram shows the pill **Menu** next to the message box when the bot has a **command list** registered. This project calls **`set_my_commands`** on startup so `/start`, `/purchase`, `/panel`, etc. appear there. Admins get extra entries (`/version`, `/admin`, `/addbin`, `/clearbin`) scoped to their chat. If you don’t see it: **restart the bot**, fully close and reopen the chat, or set commands manually in [@BotFather](https://t.me/BotFather) with **`/setcommands`**.
 
 ### “Bot doesn’t answer /start”
 
@@ -62,7 +70,7 @@ That text **does not exist** in the current `bot.py`. You are running an **older
 
 1. Stop **every** `python bot.py` / terminal running the bot (Task Manager → end Python if needed).
 2. Start again from **this** folder using `run.ps1` or `.\.venv\Scripts\python.exe bot.py`.
-3. In Telegram send **`/version`** — you should see **`shop-v7`** and the full path to the `bot.py` that is actually running.
+3. If your Telegram user ID is in **`ADMIN_TELEGRAM_IDS`** / **`UPLOAD_NOTIFY_CHAT_ID`**, send **`/version`** — you should see **`shop-v11`** and the full path to the `bot.py` that is actually running. (`/version` is **admin-only**.)
 4. Send **`/start`** and use the **new** message’s buttons (old messages still look like the old UI until you tap fresh buttons).
 
 ## Security
@@ -114,6 +122,7 @@ Optional: add a **Volume** + **`LEADBOT_DATA_DIR=/data`** so balances and stock 
    - **`TELEGRAM_BOT_TOKEN`** — from [@BotFather](https://t.me/BotFather)
    - **`UPLOAD_NOTIFY_CHAT_ID`** and/or **`ADMIN_TELEGRAM_IDS`** if you use sendout / admin / top-up flows
    - Optional: **`PAYMENT_*_ADDRESS`**, same as local `.env`
+   - Optional: **`MIN_TOPUP_USD`** — defaults to **10**. If you still see a **$30** minimum in Telegram, check you didn’t set **`MIN_TOPUP_USD=30`** here (or in `.env`); remove it or set **`MIN_TOPUP_USD=10`**, redeploy, then open **Top Up** again (old messages won’t update).
 
 4. **Persistence:** Without a volume, `data/` is wiped on redeploy. Add a **Railway Volume**, mount it (e.g. **`/data`**), and set **`LEADBOT_DATA_DIR=/data`**. The bot writes `users.json`, `catalog.json`, `bin_leads.json`, and `pending_topups.json` under that directory.
 
