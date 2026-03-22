@@ -67,7 +67,7 @@ from data_paths import data_dir
 
 _ROOT = Path(__file__).resolve().parent
 _BOT_FILE = Path(__file__).resolve()
-BOT_BUILD = "shop-v10"
+BOT_BUILD = "shop-v11"
 # Only one bot process per PC for this project (avoids Telegram getUpdates Conflict).
 _INSTANCE_PORT = 37651
 _keepalive_sock: socket.socket | None = None
@@ -137,7 +137,31 @@ def _save_users(users: dict) -> None:
     USERS_PATH.write_text(json.dumps(users, indent=2), encoding="utf-8")
 
 
-MIN_TOPUP_USD = 10.0
+def _read_min_topup_usd() -> float:
+    raw = (os.environ.get("MIN_TOPUP_USD") or "").strip()
+    if raw:
+        try:
+            v = float(raw.replace("$", "").replace(",", ""))
+            if v > 0:
+                return round(v, 2)
+        except ValueError:
+            logger.warning("Invalid MIN_TOPUP_USD=%r — using default 10", raw)
+    return 10.0
+
+
+MIN_TOPUP_USD = _read_min_topup_usd()
+logger.info("Minimum top-up: %s USD (MIN_TOPUP_USD env, default 10)", MIN_TOPUP_USD)
+
+
+def _min_topup_display() -> str:
+    m = MIN_TOPUP_USD
+    if abs(m - round(m)) < 1e-6:
+        return f"${int(round(m))}"
+    return f"${m:.2f}"
+
+
+def _topup_min_button_label() -> str:
+    return _min_topup_display()
 
 
 def get_balance(user_id: int) -> float:
@@ -392,27 +416,33 @@ def topup_amount_text() -> str:
     return (
         "💰 <b>Top-Up Your Balance</b>\n\n"
         "Select an amount to add to your balance:\n\n"
-        f"• Minimum deposit: <b>${MIN_TOPUP_USD:.0f}</b>\n"
+        f"• Minimum deposit: <b>{_min_topup_display()}</b>\n"
         "• Payment methods: Crypto (BTC, ETH, LTC)\n\n"
         "Your balance will be updated automatically after payment confirmation."
     )
 
 
 def topup_amount_keyboard(tu_back: str) -> InlineKeyboardMarkup:
+    m = MIN_TOPUP_USD
+    row1: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(_topup_min_button_label(), callback_data="tumin"),
+    ]
+    for cb, amt, lbl in (
+        ("tua100", 100.0, "$100"),
+        ("tua200", 200.0, "$200"),
+    ):
+        if amt + 1e-9 >= m:
+            row1.append(InlineKeyboardButton(lbl, callback_data=cb))
+    row2: list[InlineKeyboardButton] = []
+    for cb, amt, lbl in (
+        ("tua500", 500.0, "$500"),
+        ("tua1000", 1000.0, "$1,000"),
+    ):
+        if amt + 1e-9 >= m:
+            row2.append(InlineKeyboardButton(lbl, callback_data=cb))
+    row2.append(InlineKeyboardButton("Custom", callback_data="tuac"))
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("$10", callback_data="tua10"),
-                InlineKeyboardButton("$100", callback_data="tua100"),
-                InlineKeyboardButton("$200", callback_data="tua200"),
-            ],
-            [
-                InlineKeyboardButton("$500", callback_data="tua500"),
-                InlineKeyboardButton("$1,000", callback_data="tua1000"),
-                InlineKeyboardButton("Custom", callback_data="tuac"),
-            ],
-            [InlineKeyboardButton("⬅️ Back", callback_data=tu_back)],
-        ]
+        [row1, row2, [InlineKeyboardButton("⬅️ Back", callback_data=tu_back)]]
     )
 
 
@@ -945,8 +975,7 @@ async def show_catalog_page(
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
-PRESET_TOPUP_AMOUNTS = {
-    "tua10": 10.0,
+FIXED_TOPUP_PRESETS = {
     "tua100": 100.0,
     "tua200": 200.0,
     "tua500": 500.0,
@@ -1006,13 +1035,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             amt = float(raw)
         except ValueError:
             await update.message.reply_text(
-                f"Send a number (min ${MIN_TOPUP_USD:.0f}), e.g. <code>50</code>",
+                f"Send a number (min {_min_topup_display()}), e.g. <code>50</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
         if amt < MIN_TOPUP_USD:
             await update.message.reply_text(
-                f"Minimum is <b>${MIN_TOPUP_USD:.0f}</b>. Try again.",
+                f"Minimum is <b>{_min_topup_display()}</b>. Try again.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1564,9 +1593,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await show_topup_menu(query, context, tu_back)
         return
 
-    if data in PRESET_TOPUP_AMOUNTS:
+    if data == "tumin":
+        await show_payment_methods(query, context, MIN_TOPUP_USD)
+        return
+    if data in FIXED_TOPUP_PRESETS:
         await show_payment_methods(
-            query, context, PRESET_TOPUP_AMOUNTS[data]
+            query, context, FIXED_TOPUP_PRESETS[data]
         )
         return
 
@@ -1580,7 +1612,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("awaiting_random_qty", None)
         await query.edit_message_text(
             "💰 <b>Custom amount</b>\n\n"
-            f"Send the amount in USD (minimum <b>${MIN_TOPUP_USD:.0f}</b>).\n"
+            f"Send the amount in USD (minimum <b>{_min_topup_display()}</b>).\n"
             "Example: <code>75</code> or <code>150.50</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
