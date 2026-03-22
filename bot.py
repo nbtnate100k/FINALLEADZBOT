@@ -20,6 +20,7 @@ import io
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
     InputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -66,7 +67,7 @@ from data_paths import data_dir
 
 _ROOT = Path(__file__).resolve().parent
 _BOT_FILE = Path(__file__).resolve()
-BOT_BUILD = "shop-v9"
+BOT_BUILD = "shop-v10"
 # Only one bot process per PC for this project (avoids Telegram getUpdates Conflict).
 _INSTANCE_PORT = 37651
 _keepalive_sock: socket.socket | None = None
@@ -136,7 +137,7 @@ def _save_users(users: dict) -> None:
     USERS_PATH.write_text(json.dumps(users, indent=2), encoding="utf-8")
 
 
-MIN_TOPUP_USD = 30.0
+MIN_TOPUP_USD = 10.0
 
 
 def get_balance(user_id: int) -> float:
@@ -391,7 +392,7 @@ def topup_amount_text() -> str:
     return (
         "💰 <b>Top-Up Your Balance</b>\n\n"
         "Select an amount to add to your balance:\n\n"
-        "• Minimum deposit: <b>$30</b>\n"
+        f"• Minimum deposit: <b>${MIN_TOPUP_USD:.0f}</b>\n"
         "• Payment methods: Crypto (BTC, ETH, LTC)\n\n"
         "Your balance will be updated automatically after payment confirmation."
     )
@@ -401,7 +402,7 @@ def topup_amount_keyboard(tu_back: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("$30", callback_data="tua30"),
+                InlineKeyboardButton("$10", callback_data="tua10"),
                 InlineKeyboardButton("$100", callback_data="tua100"),
                 InlineKeyboardButton("$200", callback_data="tua200"),
             ],
@@ -875,7 +876,10 @@ async def purchase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_user.id not in get_admin_ids():
+        await update.message.reply_text("⛔ Admin only.")
         return
     try:
         mtime = datetime.fromtimestamp(_BOT_FILE.stat().st_mtime).strftime(
@@ -942,7 +946,7 @@ async def show_catalog_page(
 
 
 PRESET_TOPUP_AMOUNTS = {
-    "tua30": 30.0,
+    "tua10": 10.0,
     "tua100": 100.0,
     "tua200": 200.0,
     "tua500": 500.0,
@@ -2065,16 +2069,28 @@ async def _log_started(app: Application) -> None:
 
 async def _register_bot_menu(app: Application) -> None:
     """Populates the blue ▶ Menu button in Telegram (setMyCommands)."""
-    commands = [
+    default_cmds = [
         BotCommand("start", "Home & main buttons"),
         BotCommand("purchase", "Purchase leads menu"),
-        BotCommand("version", "Build info & tips"),
         BotCommand("request", "Custom lead request"),
         BotCommand("cancel", "Cancel admin / prompts"),
         BotCommand("panel", "Admin: stock, sync, sendout"),
     ]
+    admin_cmds = default_cmds + [
+        BotCommand("version", "Build info & tips (admin)"),
+        BotCommand("admin", "Admin tools (same as panel)"),
+        BotCommand("addbin", "Add BIN lines to catalog"),
+        BotCommand("clearbin", "Clear BINs & both stock piles"),
+    ]
     try:
-        await app.bot.set_my_commands(commands)
+        await app.bot.set_my_commands(default_cmds)
+        for aid in get_admin_ids():
+            try:
+                await app.bot.set_my_commands(
+                    admin_cmds, scope=BotCommandScopeChat(chat_id=aid)
+                )
+            except Exception as e:
+                logger.warning("set_my_commands admin scope %s: %s", aid, e)
         logger.info("Telegram command menu registered (blue Menu button).")
     except Exception as e:
         logger.warning("set_my_commands failed: %s", e)
